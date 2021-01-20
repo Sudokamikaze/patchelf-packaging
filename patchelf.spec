@@ -9,6 +9,7 @@ Group: Development/Tools
 URL: http://nixos.org/patchelf.html
 Source0: %{name}-%{version}.tar.gz
 Patch0: increase_size_to_work_with_debug_binaries.patch
+Patch1: avoid_string_table_duplicates.patch
 BuildRoot: %{_tmppath}/%{name}-%{version}-buildroot
 Prefix: /usr
 
@@ -21,6 +22,7 @@ executables and change the RPATH of executables and libraries.
 %prep
 %setup -q
 %patch0 -p1
+%patch1 -p1
 
 %build
 %if 0%{?rhel} == 6

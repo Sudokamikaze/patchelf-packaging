@@ -1,0 +1,190 @@
+From bde0cd3656babe64eaff384ebeefe33ef35abea7 Mon Sep 17 00:00:00 2001
+From: Rolf Eike Beer <eb@emlix.com>
+Date: Thu, 17 Sep 2020 10:05:43 +0200
+Subject: [PATCH 1/2] fix corrupted library names when using --replace-needed
+ multiple times
+
+When it happens that the .gnu.version_r stores the strings in .dynstr it can
+come to corruption of the library names written into DT_NEEDED:
+
+-the library names in DT_NEEDED are replaced, new entries are written to the end
+ of .dynstr
+-the version library names are replaced, and written to the end of the string
+ section.
+
+If the section for the version strings is also ".dynstr", the previous
+modifications were _not_ taken into account and things were written from the old
+end of .dynstr again. The order in which these strings were written is not the
+same as the previous replacement, so things would end up with the same size, but
+different offsets. The .gnu.version_r table is correct, the file contents are
+fine, but the offsets in the DT_NEEDED entries are wrong. Since they are printed
+as 0-terminated strings the first one replaced will always be shown correct,
+which also is the case if the argument is only used once as the string is
+replaced with itself afterwards.
+---
+ src/patchelf.cc         |  4 ++++
+ tests/Makefile.am       |  3 ++-
+ tests/replace-needed.sh | 21 +++++++++++++++++++++
+ 3 files changed, 27 insertions(+), 1 deletion(-)
+ create mode 100755 tests/replace-needed.sh
+
+diff --git a/src/patchelf.cc b/src/patchelf.cc
+index 077fb56..ea02a9c 100644
+--- a/src/patchelf.cc
++++ b/src/patchelf.cc
+@@ -1565,6 +1565,10 @@ void ElfFile<ElfFileParamNames>::replaceNeeded(const std::map<std::string, std::
+         debug("found .gnu.version_r with %i entries, strings in %s\n", verNeedNum, versionRStringsSName.c_str());
+ 
+         unsigned int verStrAddedBytes = 0;
++        // It may be that it is .dynstr again, in which case we must take the already
++        // added bytes into account.
++        if (versionRStringsSName == ".dynstr")
++            verStrAddedBytes += dynStrAddedBytes;
+ 
+         Elf_Verneed * need = (Elf_Verneed *) (contents + rdi(shdrVersionR.sh_offset));
+         while (verNeedNum > 0) {
+diff --git a/tests/Makefile.am b/tests/Makefile.am
+index 91a31b6..fb0b9ca 100644
+--- a/tests/Makefile.am
++++ b/tests/Makefile.am
+@@ -27,7 +27,8 @@ src_TESTS = \
+   output-flag.sh \
+   no-rpath-pie-powerpc.sh \
+   build-id.sh \
+-  invalid-elf.sh
++  invalid-elf.sh \
++  replace-needed.sh
+ 
+ build_TESTS = \
+   $(no_rpath_arch_TESTS)
+diff --git a/tests/replace-needed.sh b/tests/replace-needed.sh
+new file mode 100755
+index 0000000..0a5581c
+--- /dev/null
++++ b/tests/replace-needed.sh
+@@ -0,0 +1,21 @@
++#! /bin/sh -e
++SCRATCH=scratch/$(basename $0 .sh)
++
++rm -rf ${SCRATCH}
++mkdir -p ${SCRATCH}
++
++oldNeeded=$(../src/patchelf --print-needed big-dynstr)
++oldLibc=$(../src/patchelf --print-needed big-dynstr | grep -v 'foo\.so')
++../src/patchelf --output ${SCRATCH}/big-needed --replace-needed ${oldLibc} long_long_very_long_libc.so.6 --replace-needed libfoo.so lf.so big-dynstr
++
++if [ -z "$(../src/patchelf --print-needed ${SCRATCH}/big-needed | grep -Fx "long_long_very_long_libc.so.6")" ]; then
++	echo "library long_long_very_long_libc.so.6 not found as NEEDED"
++	../src/patchelf --print-needed ${SCRATCH}/big-needed
++	exit 1
++fi
++
++if [ -z "$(../src/patchelf --print-needed ${SCRATCH}/big-needed | grep -Fx "lf.so")" ]; then
++	echo "library lf.so not found as NEEDED"
++	../src/patchelf --print-needed ${SCRATCH}/big-needed
++	exit 1
++fi
+
+From 7e4532eb3392aa865c7b756bbdc5e97da7c7df15 Mon Sep 17 00:00:00 2001
+From: Rolf Eike Beer <eb@emlix.com>
+Date: Thu, 17 Sep 2020 10:26:49 +0200
+Subject: [PATCH 2/2] avoid adding the same .dynstr entries multiple times
+
+This can happen especially if .gnu.version_r stores the strings in .dynstr, so
+replacing the library names would add them twice to the same section. Keep a map
+of what was already added and where, and simply reuse the old entries if they
+are needed again.
+---
+ src/patchelf.cc | 42 +++++++++++++++++++++++++++++++++---------
+ 1 file changed, 33 insertions(+), 9 deletions(-)
+
+diff --git a/src/patchelf.cc b/src/patchelf.cc
+index ea02a9c..3801cbd 100644
+--- a/src/patchelf.cc
++++ b/src/patchelf.cc
+@@ -25,6 +25,7 @@
+ #include <sstream>
+ #include <limits>
+ #include <stdexcept>
++#include <unordered_map>
+ 
+ #include <cstdlib>
+ #include <cstdio>
+@@ -1513,6 +1514,7 @@ void ElfFile<ElfFileParamNames>::replaceNeeded(const std::map<std::string, std::
+     unsigned int verNeedNum = 0;
+ 
+     unsigned int dynStrAddedBytes = 0;
++    std::unordered_map<std::string, Elf_Off> addedStrings;
+ 
+     for ( ; rdi(dyn->d_tag) != DT_NULL; dyn++) {
+         if (rdi(dyn->d_tag) == DT_NEEDED) {
+@@ -1523,15 +1525,25 @@ void ElfFile<ElfFileParamNames>::replaceNeeded(const std::map<std::string, std::
+ 
+                 debug("replacing DT_NEEDED entry '%s' with '%s'\n", name, replacement.c_str());
+ 
++                auto a = addedStrings.find(replacement);
++                // the same replacement string has already been added, reuse it
++                if (a != addedStrings.end()) {
++                    wri(dyn->d_un.d_val, a->second);
++                    continue;
++                }
++
+                 // technically, the string referred by d_val could be used otherwise, too (although unlikely)
+                 // we'll therefore add a new string
+                 debug("resizing .dynstr ...\n");
+ 
++                // relative location of the new string
++                Elf_Off strOffset = rdi(shdrDynStr.sh_size) + dynStrAddedBytes;
+                 std::string & newDynStr = replaceSection(".dynstr",
+-                    rdi(shdrDynStr.sh_size) + replacement.size() + 1 + dynStrAddedBytes);
+-                setSubstr(newDynStr, rdi(shdrDynStr.sh_size) + dynStrAddedBytes, replacement + '\0');
++                    strOffset + replacement.size() + 1);
++                setSubstr(newDynStr, strOffset, replacement + '\0');
+ 
+-                wri(dyn->d_un.d_val, rdi(shdrDynStr.sh_size) + dynStrAddedBytes);
++                wri(dyn->d_un.d_val, strOffset);
++                addedStrings[replacement] = strOffset;
+ 
+                 dynStrAddedBytes += replacement.size() + 1;
+ 
+@@ -1569,6 +1581,9 @@ void ElfFile<ElfFileParamNames>::replaceNeeded(const std::map<std::string, std::
+         // added bytes into account.
+         if (versionRStringsSName == ".dynstr")
+             verStrAddedBytes += dynStrAddedBytes;
++        else
++            // otherwise the already added strings can't be reused
++            addedStrings.clear();
+ 
+         Elf_Verneed * need = (Elf_Verneed *) (contents + rdi(shdrVersionR.sh_offset));
+         while (verNeedNum > 0) {
+@@ -1578,15 +1593,24 @@ void ElfFile<ElfFileParamNames>::replaceNeeded(const std::map<std::string, std::
+                 auto replacement = i->second;
+ 
+                 debug("replacing .gnu.version_r entry '%s' with '%s'\n", file, replacement.c_str());
+-                debug("resizing string section %s ...\n", versionRStringsSName.c_str());
+ 
+-                std::string & newVerDynStr = replaceSection(versionRStringsSName,
+-                    rdi(shdrVersionRStrings.sh_size) + replacement.size() + 1 + verStrAddedBytes);
+-                setSubstr(newVerDynStr, rdi(shdrVersionRStrings.sh_size) + verStrAddedBytes, replacement + '\0');
++                auto a = addedStrings.find(replacement);
++                // the same replacement string has already been added, reuse it
++                if (a != addedStrings.end()) {
++                    wri(need->vn_file, a->second);
++                } else {
++                    debug("resizing string section %s ...\n", versionRStringsSName.c_str());
++
++                    Elf_Off strOffset = rdi(shdrVersionRStrings.sh_size) + verStrAddedBytes;
++                    std::string & newVerDynStr = replaceSection(versionRStringsSName,
++                        strOffset + replacement.size() + 1);
++                    setSubstr(newVerDynStr, strOffset, replacement + '\0');
+ 
+-                wri(need->vn_file, rdi(shdrVersionRStrings.sh_size) + verStrAddedBytes);
++                    wri(need->vn_file, strOffset);
++                    addedStrings[replacement] = strOffset;
+ 
+-                verStrAddedBytes += replacement.size() + 1;
++                    verStrAddedBytes += replacement.size() + 1;
++                }
+ 
+                 changed = true;
+             } else {

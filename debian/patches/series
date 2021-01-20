@@ -1,1 +1,2 @@
 increase_size_to_work_with_debug_binaries.patch
+avoid_string_table_duplicates.patch
